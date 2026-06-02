@@ -12,6 +12,7 @@ import urllib.request
 import time
 import os
 import re
+import json
 
 
 def namemodifier(string):
@@ -191,52 +192,178 @@ if __name__ == '__main__':
         os.startfile(booktitle)
 
     else:
+        # Normalize URL if in old format: e.g. /book/8335353205000005/Mystical-Journey
+        book_match_old = re.search(r'/book/(\d+)/([^/?#]+)', link)
+        if book_match_old:
+            book_id_old = book_match_old.group(1)
+            slug_old = book_match_old.group(2).lower()
+            base_url = link.split('/book/')[0]
+            link = f"{base_url}/book/{slug_old}_{book_id_old}"
+
         # get the table of contents for book
         print(now()+'Initializing the virtual browser... Might take a while')
-        options = Options()
-        options.add_argument("--headless")
-        browser = webdriver.Edge(options=options)
+        options = uc.ChromeOptions()
+        browser = uc.Chrome(options=options, version_main=148)
         browser.get(link)
-        booktitle = namemodifier(browser.title.split(' - ')[0])
-        print(now()+'Book name: %s' % booktitle)
-        print(now()+'Locating the contents page...')
-        browser.find_element(By.CLASS_NAME, 'j_show_contents').click()
         time.sleep(5)
-        pattern = re.compile(r'''<p class="ell dib vam">.*?>.*?>(.*?)<.*?</strong>.*?>(.*?)<.*?</strong>.*?>(.*?)<''',re.S)
-        bookinfo = re.findall(pattern,browser.page_source)[0]
-        contents = browser.find_elements(By.XPATH, "//a[@class='c_strong vam ell db pr']")
-        print(now()+'Retrieving table of contents')
-        links = [i.get_attribute('href') for i in contents]
-        browser.quit()
+
+        html = browser.page_source
+        book_match = re.search(r'g_data\.book\s*=\s*(\{.*?\})\s*,\s*g_data\.', html, re.S)
+        bookinfo = ("Unknown", "Unknown", "Unknown")
+        booktitle = namemodifier(browser.title.split(' - ')[0])
+
+        if book_match:
+            try:
+                def clean_json(json_str):
+                    return re.sub(r'\\(?!["\\/bfnrtu])', '', json_str)
+                book_data = json.loads(clean_json(book_match.group(1)))
+                book_info = book_data.get('bookInfo', {})
+                booktitle = namemodifier(book_info.get('bookName', booktitle))
+                
+                author = book_info.get('authorName', 'Unknown')
+                translator = book_info.get('translatorName', 'Unknown')
+                editor = book_info.get('editorName', 'Unknown')
+                bookinfo = (author, translator, editor)
+            except Exception as e:
+                print(now() + f"Failed to parse book details via JSON: {e}")
+
+        book_slug_id = ""
+        slug_id_match = re.search(r'/book/([^/?#]+)', link)
+        if slug_id_match:
+            book_slug_id = slug_id_match.group(1)
+            
+        catalog_link = f"https://www.webnovel.com/book/{book_slug_id}/catalog"
+        print(now()+'Book name: %s' % booktitle)
+        print(now()+'Loading catalog page...')
+        
+        links = []
+        try:
+            browser.get(catalog_link)
+            time.sleep(8)
+            
+            seen = set()
+            for a in browser.find_elements(By.TAG_NAME, "a"):
+                try:
+                    href = a.get_attribute("href") or ""
+                    text = a.text.strip().replace('\n', ' ')
+                    if book_slug_id and f"/book/{book_slug_id}/" in href:
+                        parts = href.split(f"/book/{book_slug_id}/")
+                        if len(parts) > 1:
+                            chap_id = parts[1].split('?')[0].split('#')[0]
+                            if chap_id and 'catalog' not in chap_id:
+                                if href not in seen:
+                                    seen.add(href)
+                                    links.append(href)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(now() + f"Failed to retrieve catalog: {e}")
+
+        if not links:
+            print(now() + 'Falling back to legacy scraping method...')
+            # Fallback to the original class name/regex parser if catalog fails
+            try:
+                browser.get(link)
+                time.sleep(5)
+                booktitle = namemodifier(browser.title.split(' - ')[0])
+                print(now()+'Book name: %s' % booktitle)
+                print(now()+'Locating the contents page...')
+                browser.find_element(By.CLASS_NAME, 'j_show_contents').click()
+                time.sleep(5)
+                pattern = re.compile(r'''<p class="ell dib vam">.*?>.*?>(.*?)<.*?</strong>.*?>(.*?)<.*?</strong>.*?>(.*?)<''',re.S)
+                bookinfo = re.findall(pattern,browser.page_source)[0]
+                contents = browser.find_elements(By.XPATH, "//a[@class='c_strong vam ell db pr']")
+                links = [i.get_attribute('href') for i in contents]
+            except Exception as e:
+                print(now() + f"Fallback scraping failed: {e}")
+                browser.quit()
+                import sys
+                sys.exit(1)
+
+        print(now()+'Found %d chapters' % len(links))
 
         # start real work
-        os.mkdir(booktitle)
+        if not os.path.exists(booktitle):
+            os.mkdir(booktitle)
         os.chdir(booktitle)
         book = open(booktitle+'.txt','a+',encoding='utf-8')
         readme = open('readme.log','a+',encoding='utf-8')
-        os.mkdir('chapters')
+        if not os.path.exists('chapters'):
+            os.mkdir('chapters')
         os.chdir('chapters')
-        for link in links:
-            page = urllib.request.urlopen(link)
-            soup = BeautifulSoup(page,'html5lib')
-            title = namemodifier(soup.find(name='div', attrs={'class': "cha-tit"}).h3.string)
-            cont = soup.find(name='div', attrs={'class': "cha-words"}).find_all(name='p')
-            book.write(title+'\n')
-            with open(title+'.txt','a+',encoding='utf-8') as f:
-                for i in cont:
+        
+        for chap_link in links:
+            try:
+                print(now() + f"Loading chapter: {chap_link}")
+                browser.get(chap_link)
+                time.sleep(3)
+                html = browser.page_source
+                
+                # Parse chapInfo JSON
+                chap_match = re.search(r'var chapInfo\s*=\s*(\{.*?\});', html, re.S)
+                if not chap_match:
+                    print(now() + f"No chapInfo JSON found for chapter. Retrying load...")
+                    time.sleep(2)
+                    html = browser.page_source
+                    chap_match = re.search(r'var chapInfo\s*=\s*(\{.*?\});', html, re.S)
+                
+                title = ""
+                paragraphs = []
+                
+                if chap_match:
                     try:
-                        text = i.get_text()
-                        text = text.strip()
-                        if text == '\n' or text == '':
+                        def clean_json(json_str):
+                            return re.sub(r'\\(?!["\\/bfnrtu])', '', json_str)
+                        chap_data = json.loads(clean_json(chap_match.group(1)))
+                        chap_info = chap_data.get('chapterInfo', {})
+                        
+                        if chap_info.get('isAuth') == 0:
+                            print(now() + f"Skipping premium chapter: {chap_link}")
                             continue
-                        elif not text.endswith('\n'):
+                            
+                        title = namemodifier(chap_info.get('chapterName', ''))
+                        
+                        for p_item in chap_info.get('contents', []):
+                            p_text = p_item.get('content', '').strip()
+                            # Strip html tags from content
+                            p_text = re.sub(r'<[^>]*>', '', p_text).strip()
+                            if p_text:
+                                paragraphs.append(p_text)
+                    except Exception as e:
+                        print(now() + f"Failed to parse chapInfo JSON: {e}")
+                
+                # Fallback to BeautifulSoup if json parse failed or is empty
+                if not title or not paragraphs:
+                    soup = BeautifulSoup(html, 'html5lib')
+                    title_elem = soup.find(name='div', attrs={'class': "cha-tit"})
+                    if title_elem and title_elem.h3:
+                        title = namemodifier(title_elem.h3.string)
+                    else:
+                        title = f"Chapter_{chap_link.split('/')[-1]}"
+                    
+                    cont_elem = soup.find(name='div', attrs={'class': "cha-words"})
+                    if cont_elem:
+                        for p in cont_elem.find_all('p'):
+                            text = p.get_text().strip()
+                            if text:
+                                paragraphs.append(text)
+                
+                if not paragraphs:
+                    print(now() + f"No text content found for chapter: {title}")
+                    continue
+
+                book.write(title+'\n')
+                with open(title+'.txt','a+',encoding='utf-8') as f:
+                    for text in paragraphs:
+                        if not text.endswith('\n'):
                             text = text + '\n'
                         f.write(text)
                         book.write(text)
-                    except (TypeError,AttributeError):
-                        pass
-            print(now()+'Downloading %s' % title)
-            time.sleep(0.1)
+                print(now()+'Downloading %s' % title)
+            except Exception as e:
+                print(now() + f"Error downloading chapter {chap_link}: {e}")
+            time.sleep(0.5)
+
         book.close()
 
         # write logs
@@ -251,5 +378,9 @@ if __name__ == '__main__':
 
         # Done!
         print('Work complete!')
+        try:
+            browser.quit()
+        except Exception:
+            pass
         os.chdir('..\..')
         os.startfile(booktitle)
